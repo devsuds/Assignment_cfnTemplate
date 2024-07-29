@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Retrieve keys form SSM parameter store and put in S3  bucket"
+Parameters:
+  bucketName:
+    Type: String
+    Description: "existing s3 bucket"
+    Default: devsudss3bucket
+  lambdaTimeout:
+    Type: Number
+    Description: "Lambdat timeout value"
+    Default: 300
+  lambdaRuntime:
+    Type: String
+    Description: "Lambda runtime"
+    Default: python3.12
+  SsmKeyName:
+    Type: String
+    Description: "key name"
+    Default: UserName
+
+Resources:
+  S3CustomResource:
+    Type: Custom::S3CustomResource
+    Properties:
+      bucket_name: !Ref bucketName
+      ServiceTimeout: 300
+      ServiceToken: !GetAtt bucketOpsLambdaFn.Arn
+
+  bucketOpsLambdaFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Retrieve keys form SSM parameter store and put in S3 \
+        bucket and delete with stack"
+      FunctionName: "excecise-lambda"
+      Handler: index.handler
+      Role: !GetAtt lambdaExecutionRole.Arn
+      Timeout: !Ref lambdaTimeout
+      Runtime: !Ref lambdaRuntime
+      Environment:
+        Variables:
+          KEY_NAME: !Ref SsmKeyName
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import os
+
+          def handler(event, context):
+              ssm = boto3.client("ssm")
+              s3 = boto3.client("s3")
+              event_name = event["RequestType"]
+              key_name = os.environ["KEY_NAME"]
+              bucket_name = event["ResourceProperties"]["bucket_name"]
+              res = {}
+
+              try:
+                  # Protection against accidental rollback
+                  if event_name == "Delete":
+                      print("Initiated deletion of objects inside s3 bucket - ", bucket_name)
+                      tmp = boto3.resource("s3")
+                      tmp.Bucket(str(bucket_name)).objects.all().delete()
+                      print("Deletion success!!")
+                  else:
+                      ssm_res = ssm.get_parameter(Name=key_name)
+                      print(ssm_res)
+                      res = s3.put_object(
+                          Bucket=bucket_name,
+                          Key="params.json",
+                          Body=json.dumps(
+                              {key_name: ssm_res["Parameter"]["Value"]}, indent=2, default=str
+                          ),
+                      )
+                      print("JSON Object added to S3 bucket")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, res)
+              except Exception as e:
+                  print("Execution failed...")
+                  print(str(e))
+                  res["Data"] = str(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, res)
+
+  lambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: "2012-10-17"
+      Path: "/"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+            Version: "2012-10-17"
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-CW
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:List*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${bucketName}
+                  - !Sub arn:aws:s3:::${bucketName}/*
+            Version: "2012-10-17"
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-lambda-S3
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ssm:GetParameter
+                Effect: Allow
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*
+            Version: "2012-10-17"
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-lambda-ssm
+      RoleName: !Sub ${AWS::StackName}-${AWS::Region}-lambdaExecutionRole
